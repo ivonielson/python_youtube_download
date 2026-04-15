@@ -22,7 +22,6 @@
 | **📹 Vídeo Único** | Baixe qualquer vídeo do YouTube em alta qualidade |
 | **🎵 Áudio MP3** | Extraia e converta áudio para formato MP3 |
 | **📋 Lista de URLs** | Baixe múltiplos vídeos de uma vez |
-| **🎮 Player Integrado** | Assista vídeos diretamente na aplicação |
 | **📁 Organização** | Downloads automaticamente organizados por tipo |
 
 </div>
