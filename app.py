@@ -63,11 +63,14 @@ download_threads: dict[str, threading.Thread] = {}
 
 # ── Limpeza automática de arquivos antigos ──────────────────────────────────
 
-def cleanup_old_files(max_age_hours: int = 24):
-    """Remove arquivos e pastas com mais de X horas, exceto downloads em andamento."""
+def cleanup_old_files(max_age_days: int = 30):
+    """
+    Remove arquivos e pastas com mais de X DIAS (padrão 30 dias),
+    exceto downloads em andamento.
+    """
     try:
         now = datetime.now()
-        cutoff = now - timedelta(hours=max_age_hours)
+        cutoff = now - timedelta(days=max_age_days)  # Agora usa DIAS corretamente
         deleted_count = 0
         
         # Coletar jobs ativos
@@ -115,26 +118,26 @@ def cleanup_old_files(max_age_hours: int = 24):
                 del progress_store[job_id]
         
         if deleted_count > 0:
-            print(f"[Cleanup] Removidos {deleted_count} arquivos/pastas com mais de {max_age_hours}h")
+            print(f"[Cleanup] Removidos {deleted_count} arquivos/pastas com mais de {max_age_days} dias")
             
     except Exception as e:
         print(f"Erro na limpeza automática: {e}")
 
 
 def start_cleanup_scheduler():
-    """Inicia um scheduler para limpeza automática a cada 6 horas."""
+    """Inicia um scheduler para limpeza automática a cada 24 horas."""
     def cleanup_loop():
         while True:
-            time.sleep(6 * 3600)  # 6 horas
-            cleanup_old_files(24)
+            time.sleep(24 * 3600)  # 24 horas (1 vez por dia)
+            cleanup_old_files(30)  # Limpa arquivos com mais de 30 DIAS
     
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
-    print("[Scheduler] Limpeza automática agendada (a cada 6 horas)")
+    print("[Scheduler] Limpeza automática agendada (a cada 24 horas, mantendo arquivos por 30 dias)")
 
 
 start_cleanup_scheduler()
-cleanup_old_files(24)
+cleanup_old_files(30)  # Limpeza inicial: remove arquivos com mais de 30 DIAS
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -526,9 +529,6 @@ def cancel_download(job_id: str):
             progress_store[job_id]['status'] = 'cancelled'
             progress_store[job_id]['message'] = '⚠️ Download cancelado - Vídeos já baixados estão disponíveis'
         
-        # NÃO remover a pasta - apenas marcar como cancelado
-        # Os arquivos já baixados permanecem
-        
         return jsonify(success=True, message='Download cancelado. Vídeos já baixados estão disponíveis.')
     
     return jsonify(success=False, error='Job não encontrado'), 404
@@ -774,10 +774,10 @@ def progress(job_id: str):
 
 @app.route('/cleanup', methods=['POST'])
 def cleanup():
-    """Limpeza manual de arquivos antigos (mais de 1 hora e não ativos)."""
+    """Limpeza manual de arquivos antigos (mais de 30 dias e não ativos)."""
     count = 0
     now = datetime.now()
-    cutoff = now - timedelta(hours=1)
+    cutoff = now - timedelta(days=30)  # Mantém mesma regra: 30 DIAS
     
     # Coletar jobs ativos
     active_jobs = set(active_downloads.keys())
@@ -905,7 +905,7 @@ def _open_browser(port: int):
 
 
 if __name__ == '__main__':
-    cleanup_old_files(24)
+    cleanup_old_files(30)  # Limpeza inicial: remove arquivos com mais de 30 DIAS
     port = _find_free_port()
     threading.Thread(target=_open_browser, args=(port,), daemon=True).start()
     print(f'YTDownloader rodando em http://127.0.0.1:{port}')
