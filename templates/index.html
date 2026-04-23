@@ -419,6 +419,23 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    @keyframes fadeInSlide {
+      from { opacity: 0; transform: translateY(-5px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .playlist-item-new { animation: fadeInSlide .22s ease forwards; }
+
+    .playlist-analyzing {
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+      padding: .7rem 1rem;
+      font-size: .8rem;
+      color: var(--muted);
+      font-family: var(--mono);
+      border-bottom: 1px solid var(--border);
+    }
+
     footer {
       margin-top: 2rem;
       font-size: .72rem;
@@ -551,6 +568,8 @@
     selectedFmt: null,
     jobId:       null,
     evtSource:   null,
+    analyzeEs:   null,
+    _totalCount: 0,
     completedItems: new Map(),
     sessionId:   null
   };
@@ -662,15 +681,26 @@
     }
   }
 
+  function isPlaylistUrl(url) {
+    const radio = [/list=RD/i, /list=WL/i, /list=LL/i, /list=HL/i, /list=LM/i, /start_radio=1/i];
+    if (radio.some(p => p.test(url))) return false;
+    return [/list=PL/i, /list=OL/i, /list=UU/i, /list=FL/i, /\/playlist\?list=/i].some(p => p.test(url));
+  }
+
   async function analyze() {
     const url = document.getElementById('urlInput').value.trim();
     if (!url) { showAlert('Cole uma URL antes de continuar.', 'warn'); return; }
 
     hideAlert();
     resetUI();
-    setAnalyzeLoading(true);
     state.url = url;
 
+    if (isPlaylistUrl(url)) {
+      analyzePlaylistStream(url);
+      return;
+    }
+
+    setAnalyzeLoading(true);
     try {
       const res  = await fetch('/analyze', {
         method: 'POST',
@@ -679,10 +709,7 @@
       });
       const data = await res.json();
 
-      if (!data.success) { 
-        showAlert(data.error || 'Erro desconhecido.'); 
-        return; 
-      }
+      if (!data.success) { showAlert(data.error || 'Erro desconhecido.'); return; }
 
       state.type    = data.type;
       state.formats = data.formats;
@@ -701,6 +728,87 @@
       showAlert('Falha na conexão: ' + e.message);
     } finally {
       setAnalyzeLoading(false);
+    }
+  }
+
+  function analyzePlaylistStream(url) {
+    setAnalyzeLoading(true);
+    state.type = 'playlist';
+    state.urls = [];
+    state.metadata = [];
+
+    // Mostrar scroll vazio com indicador de carregamento
+    const scroll = document.getElementById('playlistScroll');
+    scroll.innerHTML = '<div class="playlist-analyzing"><span class="spinner"></span>Buscando vídeos da playlist…</div>';
+    scroll.style.display = 'block';
+    document.getElementById('playlistHeader').classList.add('show');
+    document.getElementById('playlistTitle').textContent = '…';
+    document.getElementById('playlistCount').textContent = 'aguardando…';
+
+    const es = new EventSource('/analyze-playlist?url=' + encodeURIComponent(url));
+    state.analyzeEs = es;
+
+    es.onmessage = (evt) => {
+      const d = JSON.parse(evt.data);
+
+      if (d.event === 'header') {
+        state._totalCount = d.count;
+        state.formats = d.formats;
+        document.getElementById('playlistTitle').textContent = d.title;
+        document.getElementById('playlistCount').textContent = `0 / ${d.count} vídeos`;
+        // Remove indicador de loading assim que temos o cabeçalho
+        const indicator = scroll.querySelector('.playlist-analyzing');
+        if (indicator) indicator.remove();
+
+      } else if (d.event === 'item') {
+        state.urls.push(d.url);
+        state.metadata.push({ title: d.title, thumbnail: d.thumbnail, duration: d.duration, index: d.index });
+        appendPlaylistItem(d, scroll);
+        document.getElementById('playlistCount').textContent = `${d.index} / ${state._totalCount} vídeos`;
+
+      } else if (d.event === 'done') {
+        es.close();
+        state.analyzeEs = null;
+        setAnalyzeLoading(false);
+        document.getElementById('playlistCount').textContent = `${state._totalCount} vídeos`;
+        renderFormats(state.formats);
+        document.getElementById('formatSection').style.display = 'block';
+        document.getElementById('dlBtn').disabled = true;
+
+      } else if (d.event === 'error') {
+        es.close();
+        state.analyzeEs = null;
+        setAnalyzeLoading(false);
+        scroll.style.display = 'none';
+        document.getElementById('playlistHeader').classList.remove('show');
+        showAlert(d.message || 'Erro ao analisar playlist.');
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      state.analyzeEs = null;
+      setAnalyzeLoading(false);
+      showAlert('Erro de conexão ao analisar playlist.');
+    };
+  }
+
+  function appendPlaylistItem(item, scroll) {
+    const div = document.createElement('div');
+    div.className = 'playlist-item playlist-item-new';
+    const thumbSvg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='45'%3E%3Crect width='80' height='45' fill='%2326262e'/%3E%3Ctext x='40' y='28' text-anchor='middle' fill='%236b6b80' font-size='12'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E";
+    div.innerHTML = `
+      <img class="playlist-item-thumb" src="${item.thumbnail || thumbSvg}"
+           alt="thumb" onerror="this.src='${thumbSvg}'" />
+      <div class="playlist-item-info">
+        <div class="playlist-item-title"><strong>${item.index}.</strong> ${escHtml(item.title)}</div>
+        <div class="playlist-item-dur">⏱ ${item.duration || '–'}</div>
+      </div>
+    `;
+    scroll.appendChild(div);
+    // Scroll suave para mostrar o novo item apenas se estiver próximo ao fim
+    if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120) {
+      scroll.scrollTop = scroll.scrollHeight;
     }
   }
 
@@ -927,14 +1035,12 @@
     document.getElementById('completedGrid').innerHTML = '';
     document.getElementById('completedList').classList.remove('show');
     showProgress(false);
-    if (state.evtSource) { 
-      state.evtSource.close(); 
-      state.evtSource = null; 
-    }
-    state = { 
-      type: null, url: state.url || '', urls: [], metadata: [], formats: [], 
-      selectedFmt: null, jobId: null, evtSource: null, completedItems: new Map(),
-      sessionId: state.sessionId
+    if (state.evtSource)  { state.evtSource.close();  state.evtSource  = null; }
+    if (state.analyzeEs)  { state.analyzeEs.close();  state.analyzeEs  = null; }
+    state = {
+      type: null, url: state.url || '', urls: [], metadata: [], formats: [],
+      selectedFmt: null, jobId: null, evtSource: null, analyzeEs: null,
+      _totalCount: 0, completedItems: new Map(), sessionId: state.sessionId
     };
   }
 

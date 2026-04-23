@@ -9,19 +9,45 @@ import uuid
 from pathlib import Path
 import subprocess
 import time
+import random
+import sys
+import socket
+import webbrowser
 from urllib.parse import urlparse, parse_qs, urlencode
 from datetime import datetime, timedelta
 import shutil
 import atexit
 import signal
 
-app = Flask(__name__)
+
+def _resource_path(relative: str) -> Path:
+    """Retorna caminho correto para recursos — funciona em dev e no executável PyInstaller."""
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
+    return base / relative
+
+
+def _ffmpeg_location() -> str | None:
+    """Retorna pasta do FFmpeg embutido no executável, ou None para usar o do sistema."""
+    if not getattr(sys, 'frozen', False):
+        return None
+    exe_name = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
+    ffmpeg_dir = _resource_path('ffmpeg')
+    if (ffmpeg_dir / exe_name).exists():
+        return str(ffmpeg_dir)
+    return None
+
+
+app = Flask(__name__, template_folder=str(_resource_path('templates')))
 app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024 * 1024  # 4GB max
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 app.secret_key = os.urandom(24)
 
-# ── Pastas ──────────────────────────────────────────────────────────────────
-BASE_DIR      = Path(__file__).parent
+# ── Pastas ao lado do executável (ou ao lado do app.py em dev) ──────────────
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent  # pasta do .exe
+else:
+    BASE_DIR = Path(__file__).parent        # pasta do app.py
+
 DOWNLOAD_DIR  = BASE_DIR / 'downloads'
 CONVERTED_DIR = BASE_DIR / 'converted'
 TEMP_DIR      = BASE_DIR / 'temp'
@@ -120,8 +146,11 @@ def sanitize(name: str, max_len: int = 180) -> str:
 
 
 def ffmpeg_ok() -> bool:
+    loc = _ffmpeg_location()
+    exe_name = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
+    ffmpeg_exe = str(Path(loc) / exe_name) if loc else 'ffmpeg'
     try:
-        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        r = subprocess.run([ffmpeg_exe, '-version'], capture_output=True, timeout=5)
         return r.returncode == 0
     except Exception:
         return False
@@ -214,6 +243,65 @@ def get_thumbnail_url(video_id: str, quality: str = 'hqdefault') -> str:
     return qualities.get(quality, qualities['hq'])
 
 
+# ── Opções anti-detecção ─────────────────────────────────────────────────────
+
+# User-Agents de apps mobile do YouTube para rotacionar
+_MOBILE_USER_AGENTS = [
+    # Android YouTube app
+    'com.google.android.youtube/17.36.4 (Linux; U; Android 13; Pixel 7) gzip',
+    'com.google.android.youtube/17.31.35 (Linux; U; Android 12; SM-G991B) gzip',
+    'com.google.android.youtube/17.29.34 (Linux; U; Android 11; Redmi Note 10) gzip',
+    # iOS YouTube app
+    'com.google.ios.youtube/17.33.2 (iPhone14,3; U; CPU iOS 16_0 like Mac OS X)',
+    'com.google.ios.youtube/17.30.1 (iPhone13,2; U; CPU iOS 15_6 like Mac OS X)',
+]
+
+
+def _analyze_ydl_opts() -> dict:
+    """Opções para extração de metadados — usa cliente web padrão (mais compatível com playlists)."""
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'retries': 4,
+        'socket_timeout': 30,
+    }
+
+
+def _base_ydl_opts() -> dict:
+    """Opções para download com anti-detecção: cliente mobile, headers realistas e delays."""
+    ua = random.choice(_MOBILE_USER_AGENTS)
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        # Cliente Android é menos restrito que web durante downloads
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': ua,
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        'sleep_interval_requests': random.uniform(1.0, 3.0),
+        'retries': 6,
+        'fragment_retries': 6,
+        'file_access_retries': 3,
+        'socket_timeout': 30,
+        **({'ffmpeg_location': _ffmpeg_location()} if _ffmpeg_location() else {}),
+    }
+
+
+def _playlist_delay(prog: dict, idx: int, total: int):
+    """Aguarda um tempo aleatório entre vídeos de playlist para evitar detecção."""
+    if idx >= total - 1:
+        return
+    delay = random.uniform(4.0, 14.0)
+    prog['message'] = f'Aguardando {delay:.0f}s antes do próximo vídeo… ({idx + 1}/{total})'
+    time.sleep(delay)
+
+
 # ── Análise de URL ────────────────────────────────────────────────────────────
 
 @app.route('/analyze', methods=['POST'])
@@ -234,8 +322,7 @@ def analyze():
     is_playlist = is_playlist_url(clean_url)
 
     ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
+        **_analyze_ydl_opts(),
         'extract_flat': False,
         'skip_download': True,
         'noplaylist': not is_playlist,
@@ -247,6 +334,9 @@ def analyze():
             info = ydl.extract_info(clean_url, download=False)
     except Exception as e:
         return jsonify(success=False, error=str(e)), 500
+
+    if not info:
+        return jsonify(success=False, error='Não foi possível obter informações do vídeo. Verifique a URL ou tente novamente.'), 400
 
     if is_playlist and (info.get('_type') == 'playlist' or 'entries' in info):
         entries = list(info.get('entries') or [])
@@ -531,11 +621,10 @@ def _do_individual_download(job_id: str, urls: list, metadata_list: list, format
             
             if is_mp3:
                 ydl_opts = {
+                    **_base_ydl_opts(),
                     'format': 'bestaudio/best',
                     'outtmpl': str(out_dir / '%(title)s.%(ext)s'),
                     'noplaylist': True,
-                    'quiet': True,
-                    'no_warnings': True,
                     'ignoreerrors': True,
                     'progress_hooks': [_hook],
                     'postprocessors': [{
@@ -548,11 +637,10 @@ def _do_individual_download(job_id: str, urls: list, metadata_list: list, format
                 }
             else:
                 ydl_opts = {
+                    **_base_ydl_opts(),
                     'format': format_id,
                     'outtmpl': str(out_dir / '%(title)s.%(ext)s'),
                     'noplaylist': True,
-                    'quiet': True,
-                    'no_warnings': True,
                     'ignoreerrors': True,
                     'progress_hooks': [_hook],
                     'merge_output_format': 'mp4',
@@ -575,7 +663,7 @@ def _do_individual_download(job_id: str, urls: list, metadata_list: list, format
                 if downloaded_file:
                     file_id = f"{job_id}_{idx}"
                     file_url = f"/download-file/{file_id}"
-                    
+
                     prog['completed_files'].append({
                         'id': file_id,
                         'name': downloaded_file.name,
@@ -590,6 +678,8 @@ def _do_individual_download(job_id: str, urls: list, metadata_list: list, format
                     prog['downloaded'] = successful
                     prog['percent'] = (successful / len(urls)) * 100
                     prog['message'] = f'✅ {video_title[:40]} concluído! ({successful}/{len(urls)})'
+                    # Delay aleatório entre vídeos para evitar detecção
+                    _playlist_delay(prog, idx, len(urls))
                 else:
                     raise Exception("Arquivo não encontrado após download")
                     
@@ -734,11 +824,89 @@ def cleanup():
     return jsonify(success=True, message=f'{count} itens removidos, {len(jobs_to_remove)} jobs limpos')
 
 
+@app.route('/analyze-playlist')
+def analyze_playlist_stream():
+    """SSE: transmite entradas da playlist conforme são processadas."""
+    url = request.args.get('url', '').strip()
+    clean_url = extract_clean_url(url) if url else ''
+
+    def generate():
+        if not clean_url:
+            yield f"data: {json.dumps({'event': 'error', 'message': 'URL não fornecida'})}\n\n"
+            return
+
+        ydl_opts = {
+            **_analyze_ydl_opts(),
+            'extract_flat': True,
+            'skip_download': True,
+            'ignoreerrors': True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_url, download=False)
+
+            if not info:
+                yield f"data: {json.dumps({'event': 'error', 'message': 'Playlist não encontrada.'})}\n\n"
+                return
+
+            entries = [
+                e for e in (info.get('entries') or [])
+                if e and e.get('availability', 'public') not in ['private', 'deleted', 'unavailable']
+            ][:200]
+
+            yield f"data: {json.dumps({'event': 'header', 'title': info.get('title', 'Playlist'), 'count': len(entries), 'formats': _common_formats()})}\n\n"
+
+            for idx, e in enumerate(entries):
+                video_id = e.get('id', '')
+                thumbnail = e.get('thumbnail') or (get_thumbnail_url(video_id, 'hq') if video_id else None)
+                video_url = (
+                    e.get('url') or e.get('webpage_url')
+                    or (f"https://www.youtube.com/watch?v={video_id}" if video_id else '')
+                )
+                yield f"data: {json.dumps({'event': 'item', 'id': video_id, 'index': idx + 1, 'title': e.get('title', 'Sem título'), 'duration': format_duration(e.get('duration', 0)), 'thumbnail': thumbnail, 'url': video_url})}\n\n"
+
+            yield f"data: {json.dumps({'event': 'done'})}\n\n"
+
+        except Exception as ex:
+            yield f"data: {json.dumps({'event': 'error', 'message': str(ex)})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 
+def _find_free_port(start: int = 5000) -> int:
+    for port in range(start, start + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('127.0.0.1', port))
+                return port
+            except OSError:
+                continue
+    return start
+
+
+def _open_browser(port: int):
+    """Aguarda o servidor subir e abre o browser."""
+    for _ in range(40):
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=0.5):
+                webbrowser.open(f'http://127.0.0.1:{port}')
+                return
+        except OSError:
+            time.sleep(0.25)
+
+
 if __name__ == '__main__':
     cleanup_old_files(24)
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    port = _find_free_port()
+    threading.Thread(target=_open_browser, args=(port,), daemon=True).start()
+    print(f'YTDownloader rodando em http://127.0.0.1:{port}')
+    app.run(debug=False, host='127.0.0.1', port=port, threaded=True)
