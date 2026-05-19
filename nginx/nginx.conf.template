@@ -1,0 +1,55 @@
+upstream api {
+    server api:8000;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 0;
+
+    proxy_read_timeout  3600s;
+    proxy_send_timeout  3600s;
+    keepalive_timeout   3600s;
+
+    # ── Frontend estático ──────────────────────────────────────────────────────
+    location / {
+        root  /usr/share/nginx/html;
+        try_files $uri $uri/ /index.html;
+        expires 1h;
+        add_header Cache-Control "public";
+    }
+
+    # ── Streaming de vídeo/áudio (range requests, buffer maior) ───────────────
+    location /api/stream/ {
+        proxy_pass         http://api;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-API-Key         ${API_KEY};
+        proxy_set_header   Range             $http_range;
+        proxy_set_header   If-Range          $http_if_range;
+        proxy_buffer_size       128k;
+        proxy_buffers           4 256k;
+        proxy_busy_buffers_size 256k;
+    }
+
+    # ── API (SSE habilitado, injeta X-API-Key automaticamente) ────────────────
+    location /api/ {
+        proxy_pass         http://api;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-API-Key         ${API_KEY};
+
+        # SSE: sem buffer para eventos em tempo real
+        proxy_set_header   Connection        '';
+        proxy_buffering    off;
+        proxy_cache        off;
+        chunked_transfer_encoding on;
+    }
+}

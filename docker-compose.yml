@@ -1,0 +1,36 @@
+services:
+
+  api:
+    build: ./backend
+    container_name: fasttube-api
+    env_file: .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DATA_DIR: "/data"
+    volumes:
+      - fasttube_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    container_name: fasttube-nginx
+    env_file: .env
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  fasttube_data:
+    driver: local
